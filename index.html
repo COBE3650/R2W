@@ -587,7 +587,8 @@ const toKcal = (v, u) => (u || '').toLowerCase() === 'kj' ? v / 4.184 : v;
 function durMin(v, u) { u = (u || 'min').toLowerCase(); if (u === 's') return v / 60; if (u === 'hr' || u === 'h') return v * 60; return v; }
 
 function createParser() {
-  const raw = { mean: {}, sum: {}, sleep: {}, workouts: [], records: 0, hrNight: {}, standHr: {}, first: {} };
+  const raw = { mean: {}, sum: {}, sleep: {}, workouts: [], records: 0, hrNight: {}, standHr: {}, first: {}, hrT: new Float64Array(1 << 16), hrV: new Float32Array(1 << 16), hrN: 0 };
+  const pushHr = (t, v) => { if (raw.hrN === raw.hrT.length) { const T = new Float64Array(raw.hrT.length * 2), V = new Float32Array(raw.hrV.length * 2); T.set(raw.hrT); V.set(raw.hrV); raw.hrT = T; raw.hrV = V; } raw.hrT[raw.hrN] = t; raw.hrV[raw.hrN] = v; raw.hrN++; };
   const FIRST = { weight: 1, bf: 1, lean: 1 };
   const keepFirst = (m, day, t, v) => { const by = raw.first[m] || (raw.first[m] = {}), cur = by[day]; if (!cur || t < cur[0]) by[day] = [t, v]; };
   let buf = '', cur = null;
@@ -598,7 +599,7 @@ function createParser() {
       const st = attr(tag, 'startDate'), v = parseFloat(attr(tag, 'value')); if (!st || !(v > 25 && v < 230)) return;
       const src = attr(tag, 'sourceName') || '', day = st.slice(0, 10);
       if (/withings|health mate/i.test(src)) keepFirst('standHr', day, st.slice(11, 19), v);
-      else { const h = +st.slice(11, 13); if (h < 7) (raw.hrNight[day] || (raw.hrNight[day] = [])).push(v); }
+      else { const h = +st.slice(11, 13); if (h < 7) (raw.hrNight[day] || (raw.hrNight[day] = [])).push(v); const t = hkTime(st); if (isFinite(t)) pushHr(t, v); }
       return;
     }
     const m = METRIC[type]; if (!m) return;
@@ -678,6 +679,26 @@ function catOf(t) {
   return 'Other';
 }
 
+// Workouts without a stored average heart rate: compute it from the heart-rate samples recorded during the workout.
+// Time-weighted mean (gaps capped at 2 min so sparse sampling doesn't skew it) and maximum; only if there are at
+// least 3 samples spanning at least half of the workout.
+function fillWorkoutHR(raw, ws) {
+  const n = raw.hrN || 0; if (!n) return 0;
+  const T = raw.hrT, V = raw.hrV, idx = new Uint32Array(n); for (let i = 0; i < n; i++) idx[i] = i;
+  idx.sort((a, b) => T[a] - T[b]);
+  const t = new Float64Array(n), v = new Float32Array(n); for (let k = 0; k < n; k++) { t[k] = T[idx[k]]; v[k] = V[idx[k]]; }
+  const lower = x => { let lo = 0, hi = n; while (lo < hi) { const m = (lo + hi) >> 1; if (t[m] < x) lo = m + 1; else hi = m; } return lo; };
+  let filled = 0;
+  for (const w of ws) {
+    if (w.avgHR || !isFinite(w.start) || !(w.dur > 0)) continue;
+    const s = w.start, e = s + w.dur * 60000; let k = lower(s), first = -1, last = -1, cnt = 0, mx = 0, acc = 0, wt = 0;
+    for (; k < n && t[k] <= e; k++) { if (first < 0) first = k; last = k; cnt++; if (v[k] > mx) mx = v[k]; }
+    if (cnt < 3 || t[last] - t[first] < 0.5 * (e - s)) continue;
+    for (let j = first; j <= last; j++) { const dt = Math.min(j < last ? t[j + 1] - t[j] : 30000, 120000); acc += v[j] * dt; wt += dt; }
+    if (wt > 0) { w.avgHR = acc / wt; if (!w.maxHR) w.maxHR = mx; w.hrFromSamples = true; filled++; }
+  }
+  return filled;
+}
 function buildModel(raw) {
   const daily = {}; const D = k => daily[k] || (daily[k] = {});
   const r2 = v => Math.round(v * 100) / 100;
@@ -691,15 +712,19 @@ function buildModel(raw) {
     if (best && best.tot >= 120) D(k).sleep = r2(best.tot / 60), (best.deep + best.rem > 0) && (D(k).deep = r2(best.deep / 60), D(k).rem = r2(best.rem / 60));
   }
   const ws = raw.workouts.filter(w => w.dur >= 3 && isFinite(w.start)).sort((a, b) => a.start - b.start);
+  const hrFilled = fillWorkoutHR(raw, ws);
   const out = []; const score = x => (x.avgHR ? 2 : 0) + (x.dist ? 1 : 0) + x.dur / 1000;
   for (const w of ws) {
     w.cat = catOf(w.type); const p = out[out.length - 1];
-    if (p && Math.abs(w.start - p.start) < 15 * 6e4 && p.cat === w.cat) { const keep = score(w) > score(p) ? w : p; out[out.length - 1] = keep; }
+    if (p && Math.abs(w.start - p.start) < 15 * 6e4 && p.cat === w.cat) { const keep = score(w) > score(p) ? w : p, other = keep === w ? p : w;
+      if (other.avgHR && (!keep.avgHR || (keep.hrFromSamples && !other.hrFromSamples))) { keep.avgHR = other.avgHR; keep.maxHR = other.maxHR || keep.maxHR; keep.hrFromSamples = other.hrFromSamples; }
+      for (const f of ['dist', 'kcal', 'el', 'tc']) if (!isNum(keep[f]) && isNum(other[f])) keep[f] = other[f];
+      out[out.length - 1] = keep; }
     else out.push(w);
   }
-  const workouts = out.map(w => ({ d: w.day, s: Math.round(w.start / 60000), t: w.type, c: w.cat, dur: r2(w.dur), dist: w.dist ? r2(w.dist) : null, kcal: w.kcal ? Math.round(w.kcal) : null, hr: w.avgHR ? Math.round(w.avgHR) : null, mx: w.maxHR ? Math.round(w.maxHR) : null, src: w.src, in: w.indoor ? 1 : undefined, el: isNum(w.el) ? Math.round(w.el) : undefined, tc: isNum(w.tc) ? Math.round(w.tc * 10) / 10 : undefined }));
+  const workouts = out.map(w => ({ d: w.day, s: Math.round(w.start / 60000), t: w.type, c: w.cat, dur: r2(w.dur), dist: w.dist ? r2(w.dist) : null, kcal: w.kcal ? Math.round(w.kcal) : null, hr: w.avgHR ? Math.round(w.avgHR) : null, mx: w.maxHR ? Math.round(w.maxHR) : null, src: w.src, hs: w.hrFromSamples ? 1 : undefined, in: w.indoor ? 1 : undefined, el: isNum(w.el) ? Math.round(w.el) : undefined, tc: isNum(w.tc) ? Math.round(w.tc * 10) / 10 : undefined }));
   const sources = {}; workouts.forEach(w => sources[w.src] = (sources[w.src] || 0) + 1);
-  return { v: 1, importedAt: Date.now(), daily, workouts, sources, records: raw.records };
+  return { v: 1, importedAt: Date.now(), daily, workouts, sources, records: raw.records, hrFilled };
 }
 
 
@@ -713,14 +738,17 @@ function sameWorkout(a, b) {
   if (a.s != null && b.s != null) return Math.abs(a.s - b.s) <= 15;
   return a.d === b.d && Math.abs((a.dur || 0) - (b.dur || 0)) <= 2 && Math.abs((a.dist || 0) - (b.dist || 0)) <= 0.2;
 }
-const richness = w => (w.hr ? 4 : 0) + (w.dist ? 2 : 0) + (w.s != null ? 1 : 0) + (w.el != null ? 0.5 : 0);
+const richness = w => (w.hr ? (w.hs ? 3.5 : 4) : 0) + (w.dist ? 2 : 0) + (w.s != null ? 1 : 0) + (w.el != null ? 0.5 : 0);
 function dedupeWorkouts(list) {
   const sorted = list.slice().sort((a, b) => a.d.localeCompare(b.d) || (a.s ?? 0) - (b.s ?? 0)), out = [];
   let dropped = 0;
   for (const w of sorted) {
     let hit = -1;
     for (let j = out.length - 1; j >= 0 && out[j].d >= numToKey(keyToNum(w.d) - 1); j--) if (sameWorkout(out[j], w)) { hit = j; break; }
-    if (hit < 0) out.push(w); else { dropped++; if (richness(w) > richness(out[hit])) out[hit] = w; }
+    if (hit < 0) out.push(w); else { dropped++; let keep = out[hit], other = w; if (richness(w) > richness(keep)) { keep = w; other = out[hit]; } keep = { ...keep };
+      if (other.hr && (!keep.hr || (keep.hs && !other.hs))) { keep.hr = other.hr; keep.mx = other.mx || keep.mx; keep.hs = other.hs; }
+      for (const f of ['dist', 'kcal', 'el', 'tc', 's']) if (keep[f] == null && other[f] != null) keep[f] = other[f];
+      out[hit] = keep; }
   }
   return { list: out, dropped };
 }
@@ -1322,7 +1350,7 @@ const e1rm = (kg, reps) => kg * (1 + reps / 30);
 const isDip = ex => /(^|[^a-z])dips?\b/i.test(ex || '') && !/weighted/i.test(ex || '');
 
 
-if (typeof module !== 'undefined') module.exports = { weeklyTargets, dayInfo, addWithingsExtras, withingsNum, recompPosterior, kChange, quadrants, normCdf, bvnLower, recompMonths, recompWindow, recompErrorModel, changeErrorCorr, parseGoal, fmtHMS, riegel, phaseLengths, mergeHealth, mergeWithings, dedupeWorkouts, lastDay, firstDay, weightAt, repsAtWeight, parseWithings, demoWithings, standStatus, kRate, createParser, buildModel, prepare, weekSummary, suggestRamp, monthActuals, monthProjection, correlate, describeCorr, CORR_PRESETS, demoHealth, DEFAULT_SETTINGS, keyToNum, numToKey, weekStartOf, todayKey, combined, fitFitness, splitChange, kalmanLLT, hrvStatus, rhrStatus, weightRate };
+if (typeof module !== 'undefined') module.exports = { fillWorkoutHR, weeklyTargets, dayInfo, addWithingsExtras, withingsNum, recompPosterior, kChange, quadrants, normCdf, bvnLower, recompMonths, recompWindow, recompErrorModel, changeErrorCorr, parseGoal, fmtHMS, riegel, phaseLengths, mergeHealth, mergeWithings, dedupeWorkouts, lastDay, firstDay, weightAt, repsAtWeight, parseWithings, demoWithings, standStatus, kRate, createParser, buildModel, prepare, weekSummary, suggestRamp, monthActuals, monthProjection, correlate, describeCorr, CORR_PRESETS, demoHealth, DEFAULT_SETTINGS, keyToNum, numToKey, weekStartOf, todayKey, combined, fitFitness, splitChange, kalmanLLT, hrvStatus, rhrStatus, weightRate };
 
 /* ===== User guide ===== */
 const GUIDE = [
@@ -1436,6 +1464,7 @@ const GUIDE = [
       <p><b>How it’s fitted:</b> fitness over time is a smooth curve (a penalised spline with knots every two weeks). How smooth is chosen automatically by generalised cross‑validation. Robust (Huber) regression down‑weights runs that don’t fit, like intervals, GPS glitches or a bad day. 150 bootstrap refits give the 90% bands.</p>
       <p><b>Body weight for each run</b> comes from your smoothed scale trend. Before your first weigh‑in it is interpolated from your profile weight on the date you entered it, so weight you lost before the scale isn’t counted as fitness. After your latest weigh‑in it is held at the last value.</p>
       <p><b>Starting assumptions:</b> the effects of run length, hills and heat begin from physiological priors (about −3% speed per e‑fold of duration, −0.3% per m/km of climb, −0.2% per °C above 15) and are then updated by your data. This matters because long runs and fitness both increase through a training block. Without priors, the model can’t tell them apart and may credit longer runs’ extra heart rate drift to lower fitness, or the reverse. In tests on 40 simulated athletes, 8‑week fitness changes were estimated within about ±0.7 percentage points, and the 90% ranges contained the true value 90% of the time.</p>
+      <p><b>Heart rate per run:</b> normally taken from the average stored with the workout. Some apps store only the individual heart‑rate samples. Then the dashboard calculates the average itself from the samples recorded during the run: time‑weighted, so irregular sampling doesn’t skew it, and only if the samples cover at least half the run. Such runs are marked * in the Runs table. If the same run was recorded twice, the records are combined, and a stored average beats a calculated one.</p>
       <p><b>Runs it skips:</b> indoor/treadmill, under 3 km or 15 minutes, no heart rate, average HR within 25 bpm of resting or above 97% of max, and implausible paces. The Runs table shows which runs were used and why others weren’t.</p>
       <p><b>Reading the chart:</b> the pink line is fitness alone (everything rescaled to today’s weight). The dashed line is what the model says you’d actually have run then, at your weight on that date. Grey dots are individual runs after standardisation; × marks down‑weighted outliers.</p>
       <p><b>Limits:</b> it’s only as good as the HR data. Wrist HR spikes, or runs where you stopped a lot, add noise. Expect the model to need 10+ qualifying runs over 4+ weeks before it appears, and 2–3 months before trends are trustworthy.</p>` },
@@ -1837,7 +1866,7 @@ function renderRunning(v) {
     <div class="card"><h3>Fitness and fatigue ${info('g-load')}</h3><div class="chart"><canvas id="c-ctl"></canvas></div></div>
   </section>
   <section class="card"><h3>Runs</h3>${A.runs.length ? `<div class="scroll" style="max-height:420px;overflow-y:auto"><table><tr><th>Date</th><th class="num">km</th><th class="num">Time</th><th class="num">Pace</th><th class="num">HR</th><th class="num">Std. pace @${S.profile.refHR}</th><th>In model</th></tr>
-    ${A.runs.slice().reverse().slice(0, 60).map(r => `<tr><td>${fd(r.n, { day: 'numeric', month: 'short', year: '2-digit' })}</td><td class="num">${f1(r.dist)}</td><td class="num">${fmtDur(r.dur)}</td><td class="num">${fmtPace(r.pace)}</td><td class="num">${r.hr || ''}</td><td class="num">${r.stdPace && !r.exclude ? fmtPace(r.stdPace) : ''}</td><td>${r.exclude ? `<span class="muted">${esc(r.exclude)}</span>` : r.weight != null && r.weight < 0.6 ? chip('down‑weighted', 'up') : r.exclude === null ? chip('yes', 'good') : ''}</td></tr>`).join('')}</table></div>` : '<div class="empty">No runs found.</div>'}</section>`;
+    ${A.runs.slice().reverse().slice(0, 60).map(r => `<tr><td>${fd(r.n, { day: 'numeric', month: 'short', year: '2-digit' })}</td><td class="num">${f1(r.dist)}</td><td class="num">${fmtDur(r.dur)}</td><td class="num">${fmtPace(r.pace)}</td><td class="num">${r.hr || ''}${r.hs ? '<span class="muted" title="Average calculated from heart-rate samples recorded during the run">*</span>' : ''}</td><td class="num">${r.stdPace && !r.exclude ? fmtPace(r.stdPace) : ''}</td><td>${r.exclude ? `<span class="muted">${esc(r.exclude)}</span>` : r.weight != null && r.weight < 0.6 ? chip('down‑weighted', 'up') : r.exclude === null ? chip('yes', 'good') : ''}</td></tr>`).join('')}</table></div>` : '<div class="empty">No runs found.</div>'}</section>`;
   const c = css('accent');
   mk('c-goals', { type: 'bar', data: { labels: months.map(m => monthName(m).replace(' 20', ' ’')), datasets: [{ label: 'Actual', data: months.map(m => acts[m] ? +acts[m].toFixed(1) : null), backgroundColor: c, borderRadius: 4 }, { type: 'line', label: 'Goal', data: months.map(m => state.goals[m] ?? null), borderColor: css('ink'), backgroundColor: css('ink'), pointRadius: 3, borderWidth: 1.5, borderDash: [4, 3], spanGaps: true }] }, options: baseOpts() });
   const ws = weekStartOf(A.end), L = [], K = [], LR = [];
@@ -2178,7 +2207,7 @@ function renderSettings(v) {
         <div><b>Apple Health</b><span>${H ? (H.demo ? 'demo data' : (A.dataFrom ? `using data from ${fd(keyToNum(A.dataFrom), { day: 'numeric', month: 'short', year: 'numeric' })} · ` : '') + `last import ${new Date(H.importedAt).toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' })} · covers ${fd(keyToNum(firstDay(H)), { day: 'numeric', month: 'short', year: 'numeric' })} – ${fd(keyToNum(lastDay(H)), { day: 'numeric', month: 'short', year: 'numeric' })} · ${H.workouts.length} workouts${(H.imports || 1) > 1 ? ` · ${H.imports} imports merged` : ''}`) : 'not imported yet'}</span></div>
         <div><b>Withings</b><span>${state.withings ? (state.withings.demo ? 'demo data' : (() => { const ks = Object.keys(state.withings.daily).sort(); return (A.dataFrom ? `using data from ${fd(keyToNum(A.dataFrom), { day: 'numeric', month: 'short', year: 'numeric' })} · ` : '') + `last import ${new Date(state.withings.importedAt).toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' })} · covers ${fd(keyToNum(ks[0]), { day: 'numeric', month: 'short', year: 'numeric' })} – ${fd(keyToNum(ks[ks.length - 1]), { day: 'numeric', month: 'short', year: 'numeric' })} · ${ks.length} weigh‑in days${state.withings.unit ? ` · weights in ${state.withings.unit}` : ''}${state.withings.hydUnit ? ` · hydration read as ${state.withings.hydUnit}` : ''}`; })()) : 'not imported yet'}</span></div>
       </div>
-      ${H || state.withings ? `<div class="avail">${[['weight', `Weight${A.wSrc && A.wSrc.withings && A.wSrc.apple > 0 ? ` (Withings ${A.wSrc.withings}, Apple ${A.wSrc.apple})` : ''}`], ['bf', 'Body fat'], ['muscle', 'Muscle'], ['waterPct', 'Body water'], ['standHr', 'Standing HR'], ['rhr', 'Resting HR'], ['hrv', 'HRV'], ['sleep', 'Sleep'], ['vo2', `VO₂ max${A.vo2Manual.size ? ` (${A.vo2Manual.size} by hand)` : ''}`], ['vfi', 'Visceral fat']].map(([k, l]) => { const n = A[k].filter(isNum).length; return chip(`${l}: ${n ? n + ' days' : 'none'}`, n ? 'good' : 'bad'); }).join(' ')} ${chip(`Runs with HR: ${A.runs.filter(r => r.hr).length}`, A.runs.some(r => r.hr) ? 'good' : 'bad')}${A.rhrSrc.coros ? ' ' + chip(`Resting HR estimated from overnight watch HR: ${A.rhrSrc.coros} days`, 'up') : ''}</div>` : ''}
+      ${H || state.withings ? `<div class="avail">${[['weight', `Weight${A.wSrc && A.wSrc.withings && A.wSrc.apple > 0 ? ` (Withings ${A.wSrc.withings}, Apple ${A.wSrc.apple})` : ''}`], ['bf', 'Body fat'], ['muscle', 'Muscle'], ['waterPct', 'Body water'], ['standHr', 'Standing HR'], ['rhr', 'Resting HR'], ['hrv', 'HRV'], ['sleep', 'Sleep'], ['vo2', `VO₂ max${A.vo2Manual.size ? ` (${A.vo2Manual.size} by hand)` : ''}`], ['vfi', 'Visceral fat']].map(([k, l]) => { const n = A[k].filter(isNum).length; return chip(`${l}: ${n ? n + ' days' : 'none'}`, n ? 'good' : 'bad'); }).join(' ')} ${chip(`Runs with HR: ${A.runs.filter(r => r.hr).length}${A.runs.some(r => r.hs) ? ` (${A.runs.filter(r => r.hs).length} from samples)` : ''}`, A.runs.some(r => r.hr) ? 'good' : 'bad')}${A.rhrSrc.coros ? ' ' + chip(`Resting HR estimated from overnight watch HR: ${A.rhrSrc.coros} days`, 'up') : ''}</div>` : ''}
       <div class="row" style="margin-top:12px">${!H || H.demo ? '<button class="btn" data-act="demo">Load demo data</button>' : ''}${H || state.withings ? '<button class="btn ghost danger" data-act="health-clear">Remove imported data</button>' : ''}</div>
     </div>
     <div class="card"><h2>Backup ${info('g-backup')}</h2><div class="sub" style="margin-bottom:12px">Lifts, body checks, goals and settings live in this browser on this computer. Clearing browser data deletes them, so download a backup every week or two.</div>
